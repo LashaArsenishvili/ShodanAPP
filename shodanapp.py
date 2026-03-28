@@ -290,17 +290,34 @@ def shodan_dns_resolve(api_key, hostnames):
 
 # ====================== OSINT DB SEARCH ======================
 import unicodedata
+import re
 
 def osint_normalize(text):
     return unicodedata.normalize('NFC', text.strip().lower())
 
-def osint_search(query, db_paths):
-    """Search OSINT databases (mirrors L45OSINT_BOT logic)."""
-    query = query.strip()
-    results = []
-    for db_file in db_paths:
-        if not os.path.exists(db_file):
-            continue
+def _has_phone_or_email(parts):
+    """Return True if any field in parts contains a 9+ digit number or an email."""
+    phone_re  = re.compile(r'\d{9,}')
+    email_re  = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+    for field in parts:
+        if phone_re.search(field) or email_re.search(field):
+            return True
+    return False
+
+def _detect_format(db_file):
+    """Detect db format by peeking at the first non-empty line.
+
+    db.txt  format: სახელი \t გვარი \t პირადი \t ...
+                    parts[0] = სახელი (Georgian alpha)
+                    parts[1] = გვარი  (Georgian alpha)
+                    parts[2] = პირადი (digits)
+
+    db1.txt format: პირადი \t გვარი \t სახელი \t ...
+                    parts[0] = პირადი (digits)
+                    parts[1] = გვარი  (Georgian alpha)
+                    parts[2] = სახელი (Georgian alpha)
+    """
+    try:
         with open(db_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -309,32 +326,91 @@ def osint_search(query, db_paths):
                 parts = line.split('\t')
                 if len(parts) < 3:
                     continue
-                saxeli = parts[0].strip()
-                gvari  = parts[1].strip()
-                piradi = parts[2].strip()
-                # Search by ID number
-                clean_query = query.replace(" ", "").replace("-", "")
-                if clean_query.isdigit():
+                # If first field is all digits → db1 format
+                if re.match(r'^\d+$', parts[0].strip()):
+                    return "db1"
+                return "db"
+    except Exception:
+        pass
+    return "db"
+
+def osint_search(query, db_paths):
+    """Search OSINT databases supporting two formats:
+
+    db  format: სახელი \t გვარი \t პირადი_ნომ \t ელ-ფოსტა \t მობ \t ...
+    db1 format: პირადი_ნომ \t გვარი \t სახელი \t მამის_სახ \t ...
+
+    Name matching supports:
+      • სახელი გვარი  (e.g. არჩილ დვალიშვილი)
+      • გვარი სახელი  (e.g. დვალიშვილი არჩილი)
+      • multiple spaces between tokens are ignored
+
+    Only rows containing a 9+ digit number OR e-mail are returned.
+    """
+    query      = query.strip()
+    clean_query = re.sub(r'[\s\-]', '', query)
+    is_id       = clean_query.isdigit()
+    results     = []
+    seen        = set()
+
+    if not is_id:
+        q_tokens = re.split(r'\s+', query)
+        if len(q_tokens) < 2:
+            return []
+        t0 = osint_normalize(q_tokens[0])
+        t1 = osint_normalize(q_tokens[1])
+
+    for db_file in db_paths:
+        if not os.path.exists(db_file):
+            continue
+        fmt = _detect_format(db_file)
+
+        with open(db_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('\t')
+
+                if fmt == "db1":
+                    # parts: [პირადი, გვარი, სახელი, ...]
+                    if len(parts) < 3:
+                        continue
+                    piradi = parts[0].strip()
+                    gvari  = parts[1].strip()
+                    saxeli = parts[2].strip()
+                else:
+                    # parts: [სახელი, გვარი, პირადი, ...]
+                    if len(parts) < 3:
+                        continue
+                    saxeli = parts[0].strip()
+                    gvari  = parts[1].strip()
+                    piradi = parts[2].strip()
+
+                # ── Search by ID ─────────────────────────────────────
+                if is_id:
                     if clean_query == piradi or clean_query == piradi.lstrip("0"):
-                        results.append(parts)
+                        if line not in seen:
+                            seen.add(line)
+                            if fmt == "db1":
+                                results.append([saxeli, gvari, piradi] + parts[3:])
+                            else:
+                                results.append(parts)
                     continue
-                # Search by name + surname
-                q_parts = query.split()
-                if len(q_parts) < 2:
-                    continue
-                name_q    = osint_normalize(q_parts[0])
-                surname_q = osint_normalize(q_parts[1])
-                if name_q == osint_normalize(saxeli) and surname_q == osint_normalize(gvari):
-                    results.append(parts)
-    # Deduplicate
-    seen = set()
-    unique = []
-    for r in results:
-        key = "\t".join(r)
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-    return unique
+
+                # ── Search by name ───────────────────────────────────
+                n = osint_normalize(saxeli)
+                g = osint_normalize(gvari)
+                match = (t0 == n and t1 == g) or (t0 == g and t1 == n)
+                if match:
+                    if line not in seen:
+                        seen.add(line)
+                        if fmt == "db1":
+                            results.append([saxeli, gvari, piradi] + parts[3:])
+                        else:
+                            results.append(parts)
+
+    return results
 
 def matches_to_df(matches):
     rows = []
@@ -1685,7 +1761,7 @@ def render_osint_tab(lang="ka"):
                 dcc.Input(
                     id="osint-db-paths", type="text",
                     placeholder=t["osint_db_placeholder"],
-                    value="databases/gedb.txt,databases/gedb1.txt",
+                    value="db.txt,db1.txt",
                     className="stdinput",
                 ),
             ]),
@@ -1712,7 +1788,12 @@ def do_osint_search(n, query, db_paths_str, lang):
 
     db_paths = [p.strip() for p in (db_paths_str or "").split(",") if p.strip()]
     if not db_paths:
-        return html.Span(t["osint_no_db"], style={"color": YELLOW})
+        db_paths = ["db.txt", "db1.txt"]
+
+    # Always ensure both default databases are included
+    for default_db in ["db.txt", "db1.txt"]:
+        if default_db not in db_paths:
+            db_paths.append(default_db)
 
     # Check at least one db exists
     any_exists = any(os.path.exists(p) for p in db_paths)
@@ -1807,7 +1888,7 @@ def do_osint_search(n, query, db_paths_str, lang):
     prevent_initial_call=True
 )
 def download_csv(n, results):
-    if not results:
+    if not n or n == 0 or not results:
         return None
     df = matches_to_df(results)
     fname = f"shodan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
